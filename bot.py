@@ -292,8 +292,12 @@ async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
 
 # ================= /status =================
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_valid_group(update):
-        return
+    # Chỉ cho phép lệnh trong group đã lưu
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        return  # PM hoặc private chat => không phản hồi
+
+    if session["group_id"] is None or update.effective_chat.id != session["group_id"]:
+        return  # không phải group đang collect => không phản hồi
 
     if session["active"]:
         remain = int(session["end_time"] - time.time())
