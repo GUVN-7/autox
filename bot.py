@@ -3,30 +3,30 @@ import time
 import json
 import asyncio
 from datetime import time as dtime
+import pytz
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
-    MessageHandler,
     CommandHandler,
-    filters
+    MessageHandler,
+    filters,
 )
 import os
+
 TOKEN = os.getenv("BOT_TOKEN")
 
 # ================= CONFIG =================
-
 OWNER_ID = 2006042636
-
 MAX_USERS = 20
 COLLECT_DURATION = 3600  # 1 giờ
 STATE_FILE = "bot_state.json"
+TIMEZONE = pytz.timezone("Asia/Ho_Chi_Minh")
 
 TWEET_REGEX = re.compile(
     r"https?:\/\/(x|twitter)\.com\/\w+\/status\/\d+"
 )
 # ==========================================
-
 
 # ================= STATE ===================
 session = {
@@ -36,21 +36,20 @@ session = {
     "end_time": 0,
     "users": set(),
     "links": [],
-    "auto_times": [],   # ["08:00", "20:00"]
-    "jobs": [],         # job_queue objects
+    "auto_times": [],  # ["08:00", "20:00"]
+    "jobs": [],        # job_queue objects (không lưu file)
     "pinned_message_id": None
 }
 # ==========================================
 
-
 # ================= STORAGE =================
 def save_state():
-    data = {
-        "group_id": session["group_id"],
-        "auto_times": session["auto_times"]
+    tmp = {
+        "group_id": session.get("group_id"),
+        "auto_times": session.get("auto_times", [])
     }
     with open(STATE_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump(tmp, f)
 
 
 def load_state():
@@ -63,7 +62,6 @@ def load_state():
         pass
 # ==========================================
 
-
 # ================= HELPERS =================
 def is_owner(update: Update) -> bool:
     return update.effective_user.id == OWNER_ID
@@ -72,7 +70,6 @@ def is_owner(update: Update) -> bool:
 def is_valid_group(update: Update) -> bool:
     return session["group_id"] is None or update.effective_chat.id == session["group_id"]
 # ==========================================
-
 
 # ================= /start ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -94,11 +91,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text(msg)
-# ==========================================
-
 
 # ================= CORE START ==============
-async def start_collect_core(context):
+async def start_collect_core(context: ContextTypes.DEFAULT_TYPE):
     if session["active"] or not session["group_id"]:
         return
 
@@ -125,8 +120,6 @@ async def start_collect_core(context):
         pass
 
     asyncio.create_task(auto_finish(context))
-# ==========================================
-
 
 # ================= /startcollect ===========
 async def startcollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,8 +134,6 @@ async def startcollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await start_collect_core(context)
-# ==========================================
-
 
 # ================= /stopcollect ============
 async def stopcollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,26 +159,27 @@ async def stopcollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session["group_id"],
         "⛔ Collect đã bị dừng bởi admin"
     )
-# ==========================================
-
 
 # ================= /autocollect ============
 async def autocollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("DEBUG: /autocollect received", update.effective_user.id)
     if not is_owner(update):
+        print("DEBUG: Not owner")
         return
 
     if session["group_id"] is None:
         session["group_id"] = update.effective_chat.id
 
-    if not context.args:
-        await update.message.reply_text(
-            "❌ /autocollect HH:MM | remove HH:MM | off"
-        )
+    text = update.message.text or ""
+    args = text.split()[1:]  # bỏ "/autocollect"
+
+    if not args:
+        await update.message.reply_text("❌ /autocollect HH:MM | remove HH:MM | off")
         return
 
-    cmd = context.args[0]
+    cmd = args[0]
 
-    # OFF
+    # ------------------ OFF ------------------
     if cmd == "off":
         for job in session["jobs"]:
             job.schedule_removal()
@@ -197,9 +189,9 @@ async def autocollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🛑 Đã tắt toàn bộ auto collect")
         return
 
-    # REMOVE
-    if cmd == "remove" and len(context.args) == 2:
-        time_str = context.args[1]
+    # ------------------ REMOVE ------------------
+    if cmd == "remove" and len(args) == 2:
+        time_str = args[1]
         if time_str not in session["auto_times"]:
             await update.message.reply_text("⚠️ Không tìm thấy giờ này")
             return
@@ -213,7 +205,7 @@ async def autocollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🗑 Đã xoá auto collect lúc {time_str}")
         return
 
-    # ADD
+    # ------------------ ADD ------------------
     try:
         hour, minute = map(int, cmd.split(":"))
         time_str = f"{hour:02d}:{minute:02d}"
@@ -225,9 +217,12 @@ async def autocollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Giờ này đã tồn tại")
         return
 
+    async def auto_collect_job(context: ContextTypes.DEFAULT_TYPE):
+        await start_collect_core(context)
+
     job = context.application.job_queue.run_daily(
-        lambda ctx: asyncio.create_task(start_collect_core(ctx)),
-        time=dtime(hour=hour, minute=minute)
+        auto_collect_job,
+        time=dtime(hour=hour, minute=minute, tzinfo=TIMEZONE)
     )
 
     session["jobs"].append(job)
@@ -235,18 +230,14 @@ async def autocollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state()
 
     await update.message.reply_text(f"✅ Đã thêm auto collect lúc {time_str}")
-# ==========================================
-
 
 # ================= AUTO FINISH =============
-async def auto_finish(context):
+async def auto_finish(context: ContextTypes.DEFAULT_TYPE):
     while session["active"]:
         if time.time() >= session["end_time"] or len(session["users"]) >= MAX_USERS:
             await finish_collect(context)
             break
         await asyncio.sleep(5)
-# ==========================================
-
 
 # ================= COLLECT LINK ============
 async def collect_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,16 +257,14 @@ async def collect_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session["users"].add(user.id)
     name = f"@{user.username}" if user.username else user.first_name
 
-    session["links"].append(f"{len(session['links'])}. {name}\n{text}")
+    session["links"].append(f"{len(session['links']) + 1}. {name}\n{text}")
 
     await update.message.reply_text(
         f"✅ Ghi nhận ({len(session['users'])}/{MAX_USERS})"
     )
-# ==========================================
-
 
 # ================= FINISH ==================
-async def finish_collect(context):
+async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
     if not session["active"]:
         return
 
@@ -300,8 +289,6 @@ async def finish_collect(context):
         msg,
         disable_web_page_preview=True
     )
-# ==========================================
-
 
 # ================= /status =================
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -321,13 +308,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text("📴 Không có collect.")
-# ==========================================
-
 
 # ================= MAIN ====================
 def main():
     load_state()
-
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -335,22 +319,21 @@ def main():
     app.add_handler(CommandHandler("stopcollect", stopcollect))
     app.add_handler(CommandHandler("autocollect", autocollect))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, collect_link)
-    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_link))
 
     # Restore auto jobs after restart
-    for t in session["auto_times"]:
+    for t in session.get("auto_times", []):
         h, m = map(int, t.split(":"))
+        async def job_func(ctx, _h=h, _m=m):
+            await start_collect_core(ctx)
         job = app.job_queue.run_daily(
-            lambda ctx: asyncio.create_task(start_collect_core(ctx)),
-            time=dtime(hour=h, minute=m)
+            job_func,
+            time=dtime(hour=h, minute=m, tzinfo=TIMEZONE)
         )
         session["jobs"].append(job)
 
     print("🤖 Bot running | multi auto collect + remove")
     app.run_polling()
-# ==========================================
 
 
 if __name__ == "__main__":
