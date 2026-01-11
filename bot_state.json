@@ -1,1 +1,13 @@
-{"group_id": -1003605594009, "auto_times": ["07:00", "19:00"]}
+{
+  "group_id": -1003605594009,
+  "auto_times": [
+    "07:00",
+    "19:00"
+  ],
+  "last_collect_stats": {
+    "timestamp": 1700000000,
+    "user_count": 15,
+    "link_count": 15
+  },
+  "bot_start_time": 1768103417.080766
+}
