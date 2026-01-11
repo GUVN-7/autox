@@ -58,7 +58,7 @@ class BotState:
             "user_count": 0,
             "link_count": 0
         }
-        self.bot_start_time = time.time()  # Thêm bot start time vào state
+        self.bot_start_time = time.time()
     
     def to_dict(self):
         return {
@@ -87,6 +87,7 @@ class BotState:
         self.start_time = time.time()
         self.end_time = self.start_time + duration
         self.reset_collect()
+        logger.info(f"Collect started. End time: {datetime.fromtimestamp(self.end_time).strftime('%H:%M:%S')}")
     
     def stop_collect(self):
         if self.active:
@@ -101,13 +102,34 @@ class BotState:
     def get_remaining_time(self):
         if not self.active:
             return 0
-        return max(0, int(self.end_time - time.time()))
+        remaining = max(0, int(self.end_time - time.time()))
+        logger.debug(f"Remaining time: {remaining}s")
+        return remaining
     
     def get_progress_percentage(self):
         return min(100, (len(self.users) / MAX_USERS) * 100) if MAX_USERS > 0 else 0
     
     def get_bot_uptime(self):
         return int(time.time() - self.bot_start_time)
+    
+    def should_finish(self):
+        """Check if collect should finish"""
+        if not self.active:
+            return False
+        
+        current_time = time.time()
+        
+        # Check time limit
+        if current_time >= self.end_time:
+            logger.info("Time limit reached - should finish")
+            return True
+        
+        # Check user limit
+        if len(self.users) >= MAX_USERS:
+            logger.info(f"User limit reached ({len(self.users)}/{MAX_USERS}) - should finish")
+            return True
+        
+        return False
 
 # ================= GLOBALS =================
 session = BotState()
@@ -117,10 +139,9 @@ user_cooldown = defaultdict(lambda: datetime.min)
 # ================= STORAGE =================
 def save_state():
     try:
-        session.bot_start_time = session.bot_start_time  # Cập nhật thời gian
         with open(STATE_FILE, "w", encoding='utf-8') as f:
             json.dump(session.to_dict(), f, indent=2)
-        logger.info("State saved successfully")
+        logger.debug("State saved successfully")
     except Exception as e:
         logger.error(f"Failed to save state: {e}")
 
@@ -159,6 +180,24 @@ def format_time(seconds):
         return f"{minutes}m {secs}s"
     else:
         return f"{secs}s"
+# ==========================================
+
+# ================= BACKGROUND TASK =========
+async def background_checker(context: ContextTypes.DEFAULT_TYPE):
+    """Background task to check if collect should finish"""
+    while True:
+        try:
+            if session.active and session.should_finish():
+                logger.info("Background checker triggered finish_collect")
+                await finish_collect(context)
+                break
+            
+            # Check every 10 seconds
+            await asyncio.sleep(10)
+            
+        except Exception as e:
+            logger.error(f"Error in background checker: {e}")
+            await asyncio.sleep(30)
 # ==========================================
 
 # ================= /start ==================
@@ -210,27 +249,35 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📌 **Lưu ý:**
 - Bot chỉ hoạt động trong group được set
 - Collect tự động kết thúc sau 1 giờ hoặc khi đủ 20 người
+- Kết quả sẽ tự động được gửi sau khi kết thúc
 """
     await update.message.reply_text(help_text)
 
 # ================= CORE START ==============
 async def start_collect_core(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if session.active or not session.group_id:
-            logger.warning("Collect not started: active or no group")
+        if session.active:
+            logger.warning("Collect already active")
+            return
+        
+        if not session.group_id:
+            logger.warning("No group set")
             return
         
         session.start_collect()
+        
+        end_time_str = datetime.fromtimestamp(session.end_time).strftime('%H:%M:%S')
         
         msg = await context.bot.send_message(
             chat_id=session.group_id,
             text=(
                 "🚀 **BẮT ĐẦU COLLECT LINK TWEET**\n\n"
-                f"⏱ Thời gian: {COLLECT_DURATION//3600} giờ\n"
+                f"⏱ Thời gian: {COLLECT_DURATION//3600} giờ (kết thúc lúc {end_time_str})\n"
                 f"👥 Số người tối đa: {MAX_USERS}\n"
                 f"📎 Gửi link tweet hợp lệ!\n"
                 f"📊 /status – Xem trạng thái\n"
-                f"⏳ Cooldown: {USER_COOLDOWN}s giữa các lần gửi"
+                f"⏳ Cooldown: {USER_COOLDOWN}s giữa các lần gửi\n\n"
+                f"✅ Tự động tổng hợp sau {COLLECT_DURATION//3600}h hoặc khi đủ {MAX_USERS} người"
             ),
             parse_mode='Markdown'
         )
@@ -242,8 +289,10 @@ async def start_collect_core(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to pin message: {e}")
         
-        asyncio.create_task(auto_finish(context))
-        logger.info(f"Collect started in group {session.group_id}")
+        # Start background checker
+        asyncio.create_task(background_checker(context))
+        
+        logger.info(f"Collect started in group {session.group_id}. Will finish at {end_time_str}")
         
     except Exception as e:
         logger.error(f"Error in start_collect_core: {e}")
@@ -400,29 +449,6 @@ async def autocollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error adding auto collect: {e}")
         await update.message.reply_text("❌ Lỗi khi thêm auto collect")
 
-# ================= AUTO FINISH =============
-async def auto_finish(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        while session.active:
-            current_time = time.time()
-            
-            # Check time limit
-            if current_time >= session.end_time:
-                logger.info("Collect finished: Time limit reached")
-                await finish_collect(context)
-                break
-            
-            # Check user limit
-            if len(session.users) >= MAX_USERS:
-                logger.info(f"Collect finished: User limit reached ({MAX_USERS})")
-                await finish_collect(context)
-                break
-            
-            # Check every 5 seconds
-            await asyncio.sleep(5)
-    except Exception as e:
-        logger.error(f"Error in auto_finish: {e}")
-
 # ================= COLLECT LINK ============
 async def collect_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -470,7 +496,12 @@ async def collect_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         
-        logger.info(f"Link collected from user {user.id} ({name})")
+        logger.info(f"Link collected from user {user.id} ({name}). Total: {len(session.users)}/{MAX_USERS}")
+        
+        # Check if we reached max users
+        if len(session.users) >= MAX_USERS:
+            logger.info(f"Max users reached! Triggering finish_collect")
+            await finish_collect(context)
         
     except Exception as e:
         logger.error(f"Error in collect_link: {e}")
@@ -479,8 +510,14 @@ async def collect_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
     try:
         if not session.active:
+            logger.warning("finish_collect called but collect is not active")
             return
         
+        logger.info("=== FINISHING COLLECT ===")
+        logger.info(f"Users: {len(session.users)}")
+        logger.info(f"Links: {len(session.links)}")
+        
+        # Stop collect first
         session.stop_collect()
         
         # Unpin message
@@ -490,6 +527,7 @@ async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
                     session.group_id,
                     session.pinned_message_id
                 )
+                logger.info("Message unpinned")
             except Exception as e:
                 logger.error(f"Failed to unpin message: {e}")
         
@@ -502,6 +540,8 @@ async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
                 "**DANH SÁCH LINK:**\n\n"
                 + "\n\n".join(session.links)
             )
+            
+            logger.info(f"Sending summary with {len(session.links)} links")
         else:
             summary = (
                 "📊 **KẾT QUẢ COLLECT**\n\n"
@@ -511,22 +551,45 @@ async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
                 "• Chưa đủ người tham gia\n"
                 "• Thời gian chưa kết thúc"
             )
+            logger.info("No links to send")
         
-        # Send summary
-        await context.bot.send_message(
-            session.group_id,
-            summary,
-            disable_web_page_preview=True,
-            parse_mode='Markdown'
-        )
-        
-        logger.info(f"Collect finished: {len(session.users)} users, {len(session.links)} links")
+        # Send summary to group
+        try:
+            await context.bot.send_message(
+                session.group_id,
+                summary,
+                disable_web_page_preview=True,
+                parse_mode='Markdown'
+            )
+            logger.info("Summary sent to group")
+        except Exception as e:
+            logger.error(f"Failed to send summary to group: {e}")
+            
+            # Try to send to owner
+            try:
+                await context.bot.send_message(
+                    OWNER_ID,
+                    f"❌ Không thể gửi kết quả đến group {session.group_id}\n\n{summary}",
+                    disable_web_page_preview=True
+                )
+            except:
+                pass
         
         # Save stats
         save_state()
+        logger.info("=== COLLECT FINISHED ===")
         
     except Exception as e:
         logger.error(f"Error in finish_collect: {e}")
+        
+        # Try to notify owner
+        try:
+            await context.bot.send_message(
+                OWNER_ID,
+                f"❌ Lỗi khi kết thúc collect: {e}"
+            )
+        except:
+            pass
 
 # ================= /status =================
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -544,9 +607,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             progress = session.get_progress_percentage()
             progress_bar = create_progress_bar(progress)
             
+            # Calculate end time
+            end_time = datetime.fromtimestamp(session.end_time).strftime('%H:%M:%S') if session.end_time > 0 else "N/A"
+            
             status_text = (
                 f"🚀 **ĐANG COLLECT**\n\n"
                 f"⏳ Thời gian còn: {format_time(remain)}\n"
+                f"⏰ Kết thúc lúc: {end_time}\n"
                 f"👥 Người tham gia: {len(session.users)}/{MAX_USERS}\n"
                 f"📎 Số link: {len(session.links)}\n"
                 f"{progress_bar} {progress:.0f}%\n\n"
@@ -556,8 +623,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Add next auto collect if available
             if session.auto_times:
-                next_auto = session.auto_times[0]  # Simple approach
-                status_text += f"\n\n⏰ Auto tiếp theo: {next_auto}"
+                status_text += f"\n\n⏰ Auto tiếp theo: {session.auto_times[0]}"
             
         elif session.auto_times:
             times_list = "\n".join([f"• {t}" for t in session.auto_times])
@@ -744,6 +810,8 @@ def main():
     print(f"📊 Owner ID: {OWNER_ID}")
     print(f"⏰ Auto times: {session.auto_times}")
     print(f"🏠 Group ID: {session.group_id}")
+    print(f"⏱ Collect duration: {COLLECT_DURATION//3600} hours")
+    print(f"👥 Max users: {MAX_USERS}")
     print("📝 Check logs/bot.log for details")
     
     # Save initial state
