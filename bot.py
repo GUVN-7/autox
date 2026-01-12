@@ -53,6 +53,7 @@ class BotState:
         self.auto_times = []
         self.jobs = []
         self.pinned_message_id = None
+        self.result_message_id = None  # Thêm ID tin nhắn kết quả
         self.last_collect_stats = {
             "timestamp": 0,
             "user_count": 0,
@@ -97,13 +98,11 @@ class BotState:
                 "link_count": len(self.links)
             }
         self.active = False
-        self.pinned_message_id = None
     
     def get_remaining_time(self):
         if not self.active:
             return 0
         remaining = max(0, int(self.end_time - time.time()))
-        logger.debug(f"Remaining time: {remaining}s")
         return remaining
     
     def get_progress_percentage(self):
@@ -180,6 +179,13 @@ def format_time(seconds):
         return f"{minutes}m {secs}s"
     else:
         return f"{secs}s"
+
+def escape_markdown(text: str) -> str:
+    """Escape special Markdown characters"""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
 # ==========================================
 
 # ================= BACKGROUND TASK =========
@@ -249,7 +255,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📌 **Lưu ý:**
 - Bot chỉ hoạt động trong group được set
 - Collect tự động kết thúc sau 1 giờ hoặc khi đủ 20 người
-- Kết quả sẽ tự động được gửi sau khi kết thúc
+- Kết quả sẽ tự động được gửi và ghim sau khi kết thúc
 """
     await update.message.reply_text(help_text)
 
@@ -288,6 +294,16 @@ async def start_collect_core(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Message pinned: {msg.message_id}")
         except Exception as e:
             logger.error(f"Failed to pin message: {e}")
+            # Notify owner about pin error
+            try:
+                await context.bot.send_message(
+                    OWNER_ID,
+                    f"⚠️ Không thể ghim tin nhắn trong group {session.group_id}\n"
+                    f"Lỗi: {e}\n"
+                    f"Có thể bot cần quyền 'Ghim tin nhắn'."
+                )
+            except:
+                pass
         
         # Start background checker
         asyncio.create_task(background_checker(context))
@@ -296,6 +312,14 @@ async def start_collect_core(context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logger.error(f"Error in start_collect_core: {e}")
+        # Notify owner about error
+        try:
+            await context.bot.send_message(
+                OWNER_ID,
+                f"❌ Lỗi khi bắt đầu collect: {e}"
+            )
+        except:
+            pass
 
 # ================= /startcollect ===========
 async def startcollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,16 +351,18 @@ async def stopcollect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Không có collect đang chạy.")
         return
     
-    session.stop_collect()
-    
+    # Unpin message trước khi dừng
     if session.pinned_message_id:
         try:
             await context.bot.unpin_chat_message(
                 session.group_id,
                 session.pinned_message_id
             )
+            logger.info(f"Unpinned message: {session.pinned_message_id}")
         except Exception as e:
             logger.error(f"Failed to unpin message: {e}")
+    
+    session.stop_collect()
     
     await context.bot.send_message(
         session.group_id,
@@ -482,7 +508,9 @@ async def collect_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_cooldown[user.id] = now
         
         name = f"@{user.username}" if user.username else user.first_name
-        session.links.append(f"{len(session.links) + 1}. {name}\n{text}")
+        # Escape special characters in name
+        escaped_name = escape_markdown(name)
+        session.links.append(f"{len(session.links) + 1}. {escaped_name}\n{text}")
         
         # Send confirmation
         progress = session.get_progress_percentage()
@@ -517,63 +545,105 @@ async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Users: {len(session.users)}")
         logger.info(f"Links: {len(session.links)}")
         
-        # Stop collect first
-        session.stop_collect()
-        
-        # Unpin message
+        # Unpin message bắt đầu collect trước
         if session.pinned_message_id:
             try:
                 await context.bot.unpin_chat_message(
                     session.group_id,
                     session.pinned_message_id
                 )
-                logger.info("Message unpinned")
+                logger.info(f"Unpinned start message: {session.pinned_message_id}")
             except Exception as e:
-                logger.error(f"Failed to unpin message: {e}")
+                logger.error(f"Failed to unpin start message: {e}")
+        
+        # Stop collect
+        session.stop_collect()
         
         # Prepare summary message
         if session.links:
-            summary = (
-                f"📊 **KẾT QUẢ COLLECT**\n\n"
-                f"👥 Số người tham gia: {len(session.users)}\n"
-                f"📎 Số link thu được: {len(session.links)}\n\n"
-                "**DANH SÁCH LINK:**\n\n"
-                + "\n\n".join(session.links)
-            )
+            links_text = "\n\n".join(session.links)
             
-            logger.info(f"Sending summary with {len(session.links)} links")
+            # Kiểm tra độ dài tin nhắn
+            if len(links_text) > 4000:
+                # Chia thành nhiều tin nhắn
+                summary_part1 = (
+                    f"📊 **KẾT QUẢ COLLECT**\n\n"
+                    f"👥 Số người tham gia: {len(session.users)}\n"
+                    f"📎 Số link thu được: {len(session.links)}\n\n"
+                    f"**DANH SÁCH LINK:**\n\n"
+                )
+                
+                # Chia links thành các phần nhỏ
+                chunk_size = 10
+                chunks = [session.links[i:i + chunk_size] for i in range(0, len(session.links), chunk_size)]
+                
+                # Gửi phần đầu tiên và pin nó
+                first_chunk_text = "\n\n".join(chunks[0])
+                result_msg = await send_message_safe(
+                    context, 
+                    session.group_id, 
+                    summary_part1 + first_chunk_text
+                )
+                
+                # Pin tin nhắn kết quả đầu tiên
+                if result_msg:
+                    try:
+                        await context.bot.pin_chat_message(session.group_id, result_msg.message_id)
+                        session.result_message_id = result_msg.message_id
+                        logger.info(f"Pinned result message: {result_msg.message_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to pin result message: {e}")
+                
+                # Gửi các phần tiếp theo
+                for i in range(1, len(chunks)):
+                    chunk_text = "\n\n".join(chunks[i])
+                    await send_message_safe(
+                        context,
+                        session.group_id,
+                        f"**TIẾP THEO...**\n\n{chunk_text}"
+                    )
+            else:
+                # Tin nhắn ngắn, gửi một lần
+                summary = (
+                    f"📊 **KẾT QUẢ COLLECT**\n\n"
+                    f"👥 Số người tham gia: {len(session.users)}\n"
+                    f"📎 Số link thu được: {len(session.links)}\n\n"
+                    f"**DANH SÁCH LINK:**\n\n"
+                    + links_text
+                )
+                
+                # Gửi và pin tin nhắn kết quả
+                result_msg = await send_message_safe(context, session.group_id, summary)
+                if result_msg:
+                    try:
+                        await context.bot.pin_chat_message(session.group_id, result_msg.message_id)
+                        session.result_message_id = result_msg.message_id
+                        logger.info(f"Pinned result message: {result_msg.message_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to pin result message: {e}")
+            
+            logger.info(f"Sent summary with {len(session.links)} links")
         else:
             summary = (
-                "📊 **KẾT QUẢ COLLECT**\n\n"
-                "⛔ Không có link nào được gửi\n"
-                "Có thể do:\n"
-                "• Không có link hợp lệ\n"
-                "• Chưa đủ người tham gia\n"
-                "• Thời gian chưa kết thúc"
+                f"📊 **KẾT QUẢ COLLECT**\n\n"
+                f"⛔ Không có link nào được gửi\n"
+                f"Có thể do:\n"
+                f"• Không có link hợp lệ\n"
+                f"• Chưa đủ người tham gia\n"
+                f"• Thời gian chưa kết thúc"
             )
-            logger.info("No links to send")
-        
-        # Send summary to group
-        try:
-            await context.bot.send_message(
-                session.group_id,
-                summary,
-                disable_web_page_preview=True,
-                parse_mode='Markdown'
-            )
-            logger.info("Summary sent to group")
-        except Exception as e:
-            logger.error(f"Failed to send summary to group: {e}")
             
-            # Try to send to owner
-            try:
-                await context.bot.send_message(
-                    OWNER_ID,
-                    f"❌ Không thể gửi kết quả đến group {session.group_id}\n\n{summary}",
-                    disable_web_page_preview=True
-                )
-            except:
-                pass
+            # Gửi và pin tin nhắn kết quả (kể cả khi không có link)
+            result_msg = await send_message_safe(context, session.group_id, summary)
+            if result_msg:
+                try:
+                    await context.bot.pin_chat_message(session.group_id, result_msg.message_id)
+                    session.result_message_id = result_msg.message_id
+                    logger.info(f"Pinned result message: {result_msg.message_id}")
+                except Exception as e:
+                    logger.error(f"Failed to pin result message: {e}")
+            
+            logger.info("No links to send")
         
         # Save stats
         save_state()
@@ -586,10 +656,51 @@ async def finish_collect(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 OWNER_ID,
-                f"❌ Lỗi khi kết thúc collect: {e}"
+                f"❌ Lỗi khi kết thúc collect: {str(e)}"
             )
         except:
             pass
+
+async def send_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, max_retries: int = 3):
+    """Send message safely with error handling and return message object"""
+    for attempt in range(max_retries):
+        try:
+            # Try without parse_mode first if there are parse errors
+            if attempt > 0:
+                # On retry, send as plain text
+                msg = await context.bot.send_message(
+                    chat_id,
+                    text,
+                    disable_web_page_preview=True,
+                    parse_mode=None  # Plain text
+                )
+            else:
+                # First attempt with Markdown
+                msg = await context.bot.send_message(
+                    chat_id,
+                    text,
+                    disable_web_page_preview=True,
+                    parse_mode='Markdown'
+                )
+            
+            logger.info(f"Message sent successfully to {chat_id} (attempt {attempt + 1})")
+            return msg
+            
+        except Exception as e:
+            logger.warning(f"Failed to send message to {chat_id} (attempt {attempt + 1}): {e}")
+            
+            if "Can't parse entities" in str(e) and attempt == 0:
+                # Markdown parse error, retry with plain text
+                logger.info("Markdown parse error, retrying with plain text")
+                continue
+                
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+            else:
+                logger.error(f"Failed to send message after {max_retries} attempts: {e}")
+                return None
+    
+    return None
 
 # ================= /status =================
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -706,9 +817,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
+        escaped_message = escape_markdown(message)
         await context.bot.send_message(
             chat_id=session.group_id,
-            text=f"📢 **THÔNG BÁO TỪ ADMIN**\n\n{message}",
+            text=f"📢 **THÔNG BÁO TỪ ADMIN**\n\n{escaped_message}",
             parse_mode='Markdown'
         )
         await update.message.reply_text("✅ Đã gửi broadcast đến group")
@@ -780,6 +892,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("export", export))
+    # Đã xóa lệnh checkperms
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, collect_link))
     
     # Restore auto jobs after restart
@@ -813,6 +926,9 @@ def main():
     print(f"⏱ Collect duration: {COLLECT_DURATION//3600} hours")
     print(f"👥 Max users: {MAX_USERS}")
     print("📝 Check logs/bot.log for details")
+    print("\n✨ **Tính năng mới:**")
+    print("• Bot tự động unpin tin nhắn bắt đầu collect")
+    print("• Bot tự động pin tin nhắn kết quả collect")
     
     # Save initial state
     save_state()
